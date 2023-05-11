@@ -90,7 +90,7 @@ datasets.by.size <- rbindlist(lapply(datasets.by.size$name, function(testFold.pa
     diffs.list[[s]] <- seqs.diff
   }
   
-  data.table(size, name=testFold.path, data.name, test.fold, observations=nrow(diffs.list$subtrain))
+  data.table(size, name=testFold.path, data.name=paste0(data.name,"-",cv.type), test.fold, observations=nrow(diffs.list$subtrain))
 }))
 
 (testFold.vec <- Sys.glob("../neuroblastoma-data/data/*/cv/*/testFolds/*"))
@@ -106,6 +106,7 @@ OneBatch <- function(testFold.path, aum.type, init.name, seed){
   test.fold <- basename(testFold.path)
   data.dir <- dirname(dirname(cv.path))
   data.name <- basename(data.dir)
+  complete.name <- paste0(data.name,"-",cv.type)
   data.list <- list()
   for(f in c("inputs", "outputs", "evaluation")){
     f.csv.xz <- file.path(data.dir, paste0(f, ".csv.xz"))
@@ -186,12 +187,13 @@ OneBatch <- function(testFold.path, aum.type, init.name, seed){
   )
   iteration.dt.list <- list()
   considered.dt.list <- list()
+  gd.times.list <- list()
   obj.sign.list <- list(aum=1)#list(auc=-1, aum=1)
   #for(seed in seeds) { #for(init.name in names(init.fun.list)){
   init.fun <- init.fun.list[[init.name]]
   set.seed(seed)
   int.weights <- init.fun()
-  for(algo in c("grid","exactL","exactQ","hybrid"))for(objective in names(obj.sign.list)){
+  for(algo in c("grid","exactL","exactQ","hybridA","hybridB","hybridC","hybridD","hybridE"))for(objective in names(obj.sign.list)){
     start.time <- microbenchmark::get_nanotime()
     computeROC <- function(w, i, set){
       pred.pen.vec <- (X.finite %*% w) + i
@@ -225,7 +227,7 @@ OneBatch <- function(testFold.path, aum.type, init.name, seed){
     step.number <- 0
     elapsed.time <- 0
     max.iterations <- if (algo == "exactQ") {
-      nrow(diffs.list$subtrain) * (nrow(diffs.list$subtrain)) - 1 / 2
+      nrow(diffs.list$subtrain) * (nrow(diffs.list$subtrain) - 1) / 2
     } else {
       nrow(diffs.list$subtrain)
     }
@@ -337,7 +339,7 @@ OneBatch <- function(testFold.path, aum.type, init.name, seed){
           grid.result <- grid.dt[, .(search="grid", step.size, auc, aum)]
           best.grid.row <- grid.result[which.min(aum)]
         }
-      } else if (algo == "hybrid") {
+      } else if (algo == "hybridD") {
         LS=aum::aum_line_search(diffs.list$subtrain, X.subtrain, weight.vec, maxIterations=max.iterations)
         exact.result <- LS$line_search_result[, .(search="exact", step.size, auc, aum)]
         search.result <- data.table(LS$line_search_result)
@@ -349,6 +351,32 @@ OneBatch <- function(testFold.path, aum.type, init.name, seed){
           # run a grid search where we're at to find a larger step.size
           steps.list <- list()
           for (s in 10^seq(1,5)) {
+            step.size <- best.row$step.size * s
+            step.weight <- take.step(step.size)
+            step.aum <- aum_auc(diffs.list$subtrain, X.subtrain %*% step.weight)
+            if (step.aum$aum < best.row$aum) { # TODO AUC check
+              step.result <- data.table(search="grid", step.size, auc=step.aum$auc, aum=step.aum$aum)
+              steps.list[[paste(s)]] <- step.result
+            } else {
+              break
+            }
+          }
+          if (length(steps.list) > 0) {
+            grid.result <- rbindlist(steps.list)
+          }
+        }
+      } else if (algo == "hybridE") {
+        LS=aum::aum_line_search(diffs.list$subtrain, X.subtrain, weight.vec, maxIterations=max.iterations * 100)
+        exact.result <- LS$line_search_result[, .(search="exact", step.size, auc, aum)]
+        search.result <- data.table(LS$line_search_result)
+        search.result[, kink := .I/.N]
+        best.row <- search.result[which.min(aum)]
+        
+        if (best.row$kink == 1) {
+          # if kink == 1, we have chosen the very last step size we looked at.
+          # run a grid search where we're at to find a larger step.size
+          steps.list <- list()
+          for (s in 10^seq(1,9,by=0.5)) {
             step.size <- best.row$step.size * s
             step.weight <- take.step(step.size)
             step.aum <- aum_auc(diffs.list$subtrain, X.subtrain %*% step.weight)
@@ -387,12 +415,16 @@ OneBatch <- function(testFold.path, aum.type, init.name, seed){
       step.number <- step.number+1
       prev.obj <- new.obj
     }#step.number
+    gradient.descent.time <- microbenchmark::get_nanotime() - start.time
+    gd.times.list[[paste(algo)]] <- data.table(algo, gradient.descent.time,
+                                               testFold.path, data.name=complete.name, test.fold)
   }#algo/objective
   #}#seed/init.name
   list(
     sets=data.table(
       do.call(rbind, iteration.dt.list),
-      testFold.path, data.name, cv.type, test.fold))
+      testFold.path, data.name, cv.type, test.fold),
+    times=do.call(rbind, gd.times.list))
   #steps=data.table(
   #  rbindlist(considered.dt.list),
   #  data.name, cv.type, test.fold))
@@ -405,8 +437,16 @@ args.dt <- data.table::CJ(
   testFold.path=datasets.by.size$name[1:181],#testFold.vec,
   aum.type=c("rate"),#,"count")
   init.name=c("zero"),#, "IntervalRegressionCV")
-  seed=c(1, 2, 3, 4)
+  seed=c(1)
 )
+if (FALSE) {
+  args.dt <- data.table::CJ(
+    testFold.path=datasets.by.size$name[1:20],#testFold.vec,
+    aum.type=c("rate"),#,"count")
+    init.name=c("zero"),#, "IntervalRegressionCV")
+    seed=c(1, 2)
+  )
+}
 
 ## Run on SLURM.
 registry.dir <- "figure-line-grid-search-interactive-registry"
@@ -421,6 +461,8 @@ registry.dir <- "figure-line-grid-search-interactive-registry-13"# better params
 registry.dir <- "figure-line-grid-search-interactive-registry-15"# testing hybridD
 registry.dir <- "figure-line-grid-search-interactive-registry-16"# maybe final run?
 registry.dir <- "figure-line-grid-search-interactive-registry-17"# many-seeds
+registry.dir <- "figure-line-grid-search-interactive-registry-18"# time full gradient descent
+registry.dir <- "figure-line-grid-search-interactive-registry-21"# more hybrids
 
 if (FALSE) {
   reg=batchtools::loadRegistry(registry.dir, writeable = TRUE)
@@ -517,19 +559,21 @@ status.dt[!is.na(done)]
 ##job.id=21 Error in while (obj.sign * (new.obj - prev.obj) < 1e-06) { : \n  missing value where TRUE/FALSE needed => fixed by using aum package which always gives finite aum.
 
 ## Run locally.
-all.it.list <-
-  for(args.i in 1:nrow(args.dt)){
-    args.row <- args.dt[args.i]
-    cache.rds <- args.row[, file.path(testFold.path, paste0(aum.type, ".rds"))]
-    all.it.list[[args.i]] <- if(file.exists(cache.rds)){
-      readRDS(cache.rds)
-    }else{
-      cat(sprintf("%4d / %4d\n", args.i, length(args.dt)))
-      print(args.row)
-      iteration.list <- do.call(OneBatch, args.row)
-      saveRDS(iteration.list, cache.rds)
+if (FALSE){
+  all.it.list <-
+    for(args.i in 1:nrow(args.dt)){
+      args.row <- args.dt[args.i]
+      cache.rds <- args.row[, file.path(testFold.path, paste0(aum.type, ".rds"))]
+      all.it.list[[args.i]] <- if(file.exists(cache.rds)){
+        readRDS(cache.rds)
+      }else{
+        cat(sprintf("%4d / %4d\n", args.i, length(args.dt)))
+        print(args.row)
+        iteration.list <- do.call(OneBatch, args.row)
+        saveRDS(iteration.list, cache.rds)
+      }
     }
-  }
+}
 
 ## analyze.
 if (FALSE){
@@ -610,6 +654,7 @@ if(FALSE) {
 
 # load all results and build one big data table
 result.sets.list <- list()
+time.sets.list <- list()
 status.dt <- batchtools::getJobStatus(reg=reg)
 completed.jobs <- status.dt[is.na(error)]$job.id
 for (result.id in completed.jobs) {
@@ -617,12 +662,16 @@ for (result.id in completed.jobs) {
   if (!is.na(status.dt[job.id==result.id]$done)) {
     r <- batchtools::loadResult(result.id, reg)
     r$sets[,result.id:=result.id]
+    r$times[,result.id:=result.id]
     result.sets.list[[result.id]] <- r$sets
+    time.sets.list[[result.id]] <- r$times
     r <- NULL
   }
 }
 result.sets <- do.call(rbind, result.sets.list)
+time.sets <- do.call(rbind, time.sets.list)
 result.sets.list <- NULL
+time.sets.list <- NULL
 
 algo.time.by.dataset <- data.table(result.sets[init.name=="zero"][objective=="aum"][set=="validation"] %>%
                                      group_by(result.id, algo, testFold.path) %>%
@@ -635,15 +684,16 @@ algo.time.by.dataset.with.inits <- data.table(result.sets[objective=="aum"][set=
                                                 reframe(total.time = sum(elapsed.time)))
 colnames(algo.time.by.dataset.with.inits)[colnames(algo.time.by.dataset.with.inits) == "testFold.path"] <- "name"
 results.with.dataset.size.and.init <- merge(algo.time.by.dataset.with.inits, datasets.by.size, on=.(name))
-
+datasets.by.size[,testFold.path:=name]
+gd.timings <- merge(time.sets, datasets.by.size, on=.(testFold.path))
 
 # name for the folder for the images below to go in
-experiment.name <- "many-seeds"
+experiment.name <- "manyHybrids"
 dir.create(file.path(experiment.name))
 
 
 # palette for everything below
-cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#DA72B2", "#D55E00", "#F2D0A4")
+cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#DA72B2", "#0000FF", "#F2D0A4", "#FF0000", "#00FF00")
 
 # plot elapsed time per step of gradient descent for each algo/dataset
 ggplot(result.sets[objective=="aum"][set=="validation"]) +
@@ -875,17 +925,18 @@ results.with.dataset.size %>%
   ggtitle("Dataset size vs. Algorithm time")
 ggsave(paste(sep="/", experiment.name, "size.affects.time4.png"), width=1920*2, height=1080*2, units="px")
 
-rfac <- 2
-results.with.dataset.size.and.init[, N := 10^(round(log10(size)*rfac)/rfac)]
-
+rfac <- 4
+results.with.dataset.size.and.init[, N := 10^(round(log10(observations)*rfac)/rfac)]
 results.with.dataset.size.and.init[,data.table(min=min(total.time),max=max(total.time),mean=mean(total.time)), by=.(algo, N)] %>%
   #group_by(algo, s=signif(size, 3)) %>%
   #reframe(t=mean(total.time)) %>%
   ggplot() +
-  geom_ribbon(aes(x=N, ymin=min, ymax=max, fill=algo), alpha=0.10) +
+  geom_point(data=results.with.dataset.size.and.init[,data.table(mean=mean(total.time)), by=.(algo, observations)],
+             aes(x=observations, y=mean, color=algo), size=0.4, alpha=0.35) +
+  geom_ribbon(aes(x=N, ymin=min, ymax=max, fill=algo), alpha=0.1) +
   geom_line(aes(x=N, y=mean, color=algo), size=0.8) +
-  geom_point(aes(x=N, y=max, color=algo), size=0.7, alpha=0.10) +
-  geom_point(aes(x=N, y=min, color=algo), size=0.7, alpha=0.10) +
+  geom_point(aes(x=N, y=max, color=algo), size=0.7, alpha=0.05) +
+  geom_point(aes(x=N, y=min, color=algo), size=0.7, alpha=0.05) +
   geom_point(aes(x=N, y=mean, color=algo), size=1.2) +
   #geom_smooth(level=0.95)+#geom_smooth(level=0.70,span=0.6) +
   scale_y_log10() +
@@ -894,7 +945,7 @@ results.with.dataset.size.and.init[,data.table(min=min(total.time),max=max(total
   scale_fill_manual(values=cbPalette) +
   #facet_grid(init.name ~ .) +
   xlab("B = number of breakpoints in error functions") +
-  ylab("Total time (seconds)") + theme_bw()
+  ylab("Time for line search inside\neach step of gradient descent\nuntil subtrain AUM increases\n(seconds)") + theme_bw()
 #ggtitle("Dataset size vs. Algorithm time")
 ggsave(paste(sep="/", experiment.name, "size.affects.time5.png"), width=1920*0.75, height=1080*0.75, units="px")
 
@@ -931,13 +982,15 @@ ggsave(paste(sep="/", experiment.name, "total.time2.png"), width=1920*1.5, heigh
 
 selected.datasets <- c("H3K9me3_TDH_BP", "ATAC_JV_adipose", "H3K27ac-H3K4me3_TDHAM_BP", "detailed")
 selected.datasets <- c("H3K9me3_TDH_BP", "detailed")
+selected.datasets <- c("H3K9me3_TDH_BP", "ATAC_JV_adipose", "detailed")
 
 (dataset.labels <- map(selected.datasets, function(x) {
+  obs <- datasets.by.size[data.name==x]$observations
   size <- mean(datasets.by.size[data.name==x]$observations)
   rounded.size <- round(10^(round(log10(size)*2)/2))
   paste0(x, " (n≃",rounded.size,")")
   paste0(x, " (n=",size,")")
-  paste0("B=",round(size))
+  paste0("B=[",min(obs),"-", max(obs),"] l=", length(obs))
 }))
 
 
@@ -956,3 +1009,74 @@ result.sets[data.name %in% selected.datasets] %>%
 #ggtitle("Time for selected datasets")
 ggsave(paste(sep="/", experiment.name, "boxplot.datasets.png"), width=1920*0.75, height=1080*0.75, units="px")
 
+result.sets[data.name %in% selected.datasets] %>%
+  group_by(result.id, algo, data.name, seed) %>%
+  reframe(total.time = sum(elapsed.time)) %>%
+  ggplot() +
+  geom_boxplot(aes(x=total.time, y=factor(algo, levels=c("hybrid","exactL","exactQ","grid"))), show.legend = FALSE) +
+  facet_grid(.~factor(data.name, levels=selected.datasets, labels=dataset.labels), scales = "free") +
+  scale_x_log10() +
+  scale_colour_manual(values=cbPalette) +
+  scale_fill_manual(values=cbPalette) +
+  ylab("Line Search") +
+  xlab("Total time to compute line search (seconds)") +
+  theme_bw()
+#ggtitle("Time for selected datasets")
+ggsave(paste(sep="/", experiment.name, "boxplot.datasets.png"), width=1920*1, height=1080*0.5, units="px")
+
+result.sets[data.name %in% selected.datasets][set=="validation"] %>%
+  group_by(result.id, algo, data.name, seed) %>%
+  reframe(max.auc = max(auc)) %>%
+  ggplot() +
+  geom_boxplot(aes(x=max.auc,y=factor(algo, levels=c("hybrid","exactL","exactQ","grid")))) +
+  facet_grid(.~factor(data.name, levels=selected.datasets, labels=dataset.labels), scales = "free") +
+  scale_x_log10() +
+  scale_colour_manual(values=cbPalette) +
+  scale_fill_manual(values=cbPalette) +
+  ylab("Line Search") +
+  xlab("Max Validation AUC") +
+  theme_bw()
+ggsave(paste(sep="/", experiment.name, "max.auc.png"), width=1920*1, height=1080*0.5, units="px")
+
+
+rfac <- 4
+gd.timings[, N := 10^(round(log10(observations)*rfac)/rfac)]
+gd.timings[, total.time := (gradient.descent.time / 1e9)] # convert nanoseconds to seconds
+gd.timings[,data.table(min=min(total.time),max=max(total.time),mean=mean(total.time)), by=.(algo, N)] %>%
+  ggplot() +
+  geom_point(data=gd.timings, aes(x=observations, y=gradient.descent.time/1e9, color=algo), size=0.4, alpha=0.1) +
+  geom_ribbon(aes(x=N, ymin=min, ymax=max, fill=algo), alpha=0.1) +
+  geom_line(aes(x=N, y=mean, color=algo), size=0.8) +
+  geom_point(aes(x=N, y=max, color=algo), size=0.7, alpha=0.05) +
+  geom_point(aes(x=N, y=min, color=algo), size=0.7, alpha=0.05) +
+  geom_point(aes(x=N, y=mean, color=algo), size=1.2) +
+  scale_y_log10() +
+  scale_x_log10() +
+  scale_colour_manual(values=cbPalette) +
+  scale_fill_manual(values=cbPalette) +
+  xlab("B = number of breakpoints in error functions") +
+  ylab("Time for gradient descent\nuntil subtrain AUM increases\n(seconds)") + theme_bw()
+ggsave(paste(sep="/", experiment.name, "gradient.descent.timings.png"), width=1920*0.75, height=1080*0.75, units="px")
+
+
+result.steps <- data.table(result.sets %>% group_by(algo, data.name, cv.type, test.fold, result.id) %>% summarize(steps=n()))
+result.steps[, data.name := paste0(data.name, "-", cv.type)]
+result.steps <- merge(result.steps, datasets.by.size, on=.(data.name,test.fold),by=.EACHI,allow.cartesian=TRUE)
+rfac <- 4
+result.steps[, N := 10^(round(log10(observations)*rfac)/rfac)]
+result.steps[,data.table(min=min(steps),max=max(steps),mean=mean(steps)), by=.(algo, N)] %>%
+  ggplot() +
+  geom_point(data=result.steps, aes(x=observations, y=steps, color=algo), size=0.4, alpha=0.1) +
+  geom_ribbon(aes(x=N, ymin=min, ymax=max, fill=algo), alpha=0.1) +
+  geom_line(aes(x=N, y=mean, color=algo), size=0.8) +
+  geom_point(aes(x=N, y=max, color=algo), size=0.7, alpha=0.05) +
+  geom_point(aes(x=N, y=min, color=algo), size=0.7, alpha=0.05) +
+  geom_point(aes(x=N, y=mean, color=algo), size=1.2) +
+  
+  scale_y_log10() +
+  scale_x_log10() +
+  scale_colour_manual(values=cbPalette) +
+  scale_fill_manual(values=cbPalette) +
+  xlab("B = number of breakpoints in error functions") +
+  ylab("Steps of gradient descent\nuntil subtrain AUM increases") + theme_bw()
+ggsave(paste(sep="/", experiment.name, "step.count.png"), width=1920*0.75, height=1080*0.75, units="px")
